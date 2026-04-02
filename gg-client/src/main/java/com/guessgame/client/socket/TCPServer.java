@@ -8,6 +8,10 @@ import java.nio.channels.ServerSocketChannel;
 import java.nio.channels.SocketChannel;
 import java.nio.channels.Selector;
 import java.nio.channels.SelectionKey;
+import java.nio.ByteBuffer;
+
+import java.util.Map;
+import java.util.HashMap;
 
 public class TCPServer {
     private int port;
@@ -16,8 +20,10 @@ public class TCPServer {
     private InetAddress inetAddress;
     private SocketAddress socketAddress;
     private ServerSocketChannel serverSocketChannel;
-
     private Selector selector;
+
+    private record ClientInfo(RingBuffer readBuffer, RingBuffer writeBuffer) {}
+    private Map<SocketChannel, ClientInfo> clientBuffers;
 
     private boolean isRunning = false;
 
@@ -51,6 +57,7 @@ public class TCPServer {
     }
 
     public void listen() {
+        this.clientBuffers = new HashMap<>();
         try {
             this.inetAddress = InetAddress.getByName(ip);
             this.socketAddress = new InetSocketAddress(inetAddress, port);
@@ -68,6 +75,19 @@ public class TCPServer {
     }
 
     public void close() {
+        if (!isRunning) {
+            return;
+        }
+        if (clientBuffers != null) {
+            for (SocketChannel channel : clientBuffers.keySet()) {
+                try {
+                    channel.close();
+                } catch (Exception e) {
+                    System.err.println("Failed to close client channel: " + e.getMessage());
+                }
+            }
+            clientBuffers.clear();
+        }
         try {
             if (selector != null) selector.close();
             if (serverSocketChannel != null) serverSocketChannel.close();
@@ -85,9 +105,65 @@ public class TCPServer {
             clientChannel.configureBlocking(false);
             clientChannel.register(selector, SelectionKey.OP_READ);
             clientChannel.register(selector, SelectionKey.OP_WRITE);
+            clientBuffers.put(clientChannel, new ClientInfo(new RingBuffer(1024, (byte) '\n'), new RingBuffer(1024, (byte) '\n')));
         } catch(Exception e) {
             throw new RuntimeException("Failed to accept connection: " + e.getMessage(), e);
         }
+    }
+
+    private void read(SelectionKey key) {
+        SocketChannel clientChannel = (SocketChannel) key.channel();
+        ByteBuffer buffer = ByteBuffer.allocate(1024);
+        buffer.clear();
+
+        try {
+            long bytesRead = clientChannel.read(buffer);
+            if (bytesRead == -1) {
+                clientChannel.close();
+                key.cancel();
+                return;
+            }
+            RingBuffer readBuffer = clientBuffers.get(clientChannel).readBuffer();
+            readBuffer.write(buffer.array(), (int) bytesRead);
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to read from client: " + e.getMessage(), e);
+        }
+    }
+
+    private void write(SelectionKey key) {
+        SocketChannel clientChannel = (SocketChannel) key.channel();
+
+        try {
+            RingBuffer writeBuffer = clientBuffers.get(clientChannel).writeBuffer();
+            ByteBuffer message = writeBuffer.getNextMessage();
+            if (message != null) {
+                clientChannel.write(message);
+            }
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to write to client: " + e.getMessage(), e);
+        }
+
+    }
+
+    private void serveOnce() {
+        ClientInfo clientInfo;
+        try {
+            selector.select();
+       } catch (Exception e) {
+            throw new RuntimeException("Failed to select: " + e.getMessage(), e);
+        }
+
+        for (SelectionKey key : selector.selectedKeys()) {
+            if (key.isAcceptable()) {
+                accept(key);
+            }
+            if (key.isReadable()) {
+                read(key);
+            }
+            if (key.isWritable()) {
+                write(key);
+            }
+       }
     }
 
 };
